@@ -1,11 +1,9 @@
 package gogrpcpool
 
 import (
-	"fmt"
+	"context"
 	"log"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -24,40 +22,46 @@ type Pool struct {
 	connIdleCount    int32 // current count of idle connections
 	connClosingCount int32 // current count of closing connections
 
-	connIndex int32 // next index to acquire
-	refCount  int32 // current count of references
+	refCount    int32      // current count of references
+	readyTunnel chan *Conn // ready tunnel
 }
 
 // 实例化连接池
 func NewPool(opts Options) *Pool {
+	if opts.Target == "" {
+		log.Fatalf("new Pool Failed: %v", ErrTargetNotAvailable)
+	}
+
 	pool := &Pool{
 		opts: Options{
-			Debug:        opts.Debug,
-			CheckPeriod:  opts.CheckPeriod,
-			Target:       opts.Target,
-			Dopts:        []grpc.DialOption{},
-			MaxIdleConns: opts.MaxIdleConns,
-			MaxConns:     opts.MaxConns,
-			MaxRefs:      opts.MaxRefs,
-			NewByRefRate: opts.NewByRefRate,
-			PanicOnErr:   opts.PanicOnErr,
+			Debug:            opts.Debug,
+			DescribeDuration: opts.DescribeDuration,
+			CheckPeriod:      opts.CheckPeriod,
+			ConnTimeOut:      opts.ConnTimeOut,
+			Target:           opts.Target,
+			Dopts:            []grpc.DialOption{},
+			MaxConns:         opts.MaxConns,
+			MaxIdleConns:     opts.MaxIdleConns,
+			MaxRefs:          opts.MaxRefs,
+			NewConnRate:      opts.NewConnRate,
 		},
-		connQuota: opts.MaxConns,
-		conns:     []*Conn{},
-		connIndex: -1,
+		readyTunnel: make(chan *Conn, opts.MaxConns),
+		connQuota:   opts.MaxConns,
+		conns:       []*Conn{},
 	}
 
 	if pool.opts.CheckPeriod < time.Second*3 {
 		pool.opts.CheckPeriod = time.Second * 3
 	}
 
-	if pool.opts.NewByRefRate < 2 {
-		pool.opts.NewByRefRate = 2
+	if pool.opts.NewConnRate < 2 {
+		pool.opts.NewConnRate = 2
 	}
 
-	if opts.Target == "" {
-		log.Fatalf("new Pool Failed: %v", ErrTargetNotAvailable)
+	if pool.opts.DescribeDuration <= time.Duration(0) {
+		pool.opts.DescribeDuration = time.Second * 1
 	}
+
 	pool.opts.Dopts = append(pool.opts.Dopts, opts.Dopts...)
 
 	return pool
@@ -65,21 +69,59 @@ func NewPool(opts Options) *Pool {
 
 // 启动
 func (p *Pool) Run() {
-	// 初始化空闲连接
-	p.initIdleConns()
+	p.initConns()
 
-	// 启动连接数控制线程
-	go p.idleConnManager()
-
-	// debug 打印
 	if p.opts.Debug {
 		go p.DescribeTimer()
 	}
+
+	go p.idleConnManager()
 }
 
-// 初始化，按照最大空闲数建立连接
-// 1. 只能在初始化时调用一次
-func (p *Pool) initIdleConns() {
+// 关闭连接
+func (p *Pool) Close() {
+	p.Lock()
+	defer p.Unlock()
+
+	// 设置执行超时
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	// 标记所有连接为关闭状态
+	for _, conn := range p.conns {
+		conn.setClosing()
+	}
+
+	// 关闭就绪通道
+	close(p.readyTunnel)
+
+	// 定时循环检查连接是否被回收完毕
+	tricker := time.NewTicker(time.Second * 2)
+	for p.chkConnReferd() > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tricker.C:
+		}
+	}
+
+	// 关闭所有的连接
+	for _, conn := range p.conns {
+		conn.close()
+	}
+
+	// 清空连接池
+	p.conns = []*Conn{}
+
+	// 清空原子计数
+	p.resetConnCount(0)
+	p.resetIdleConnCount(0)
+	p.resetClosingConnCount(0)
+	p.resetConnRefCount(0)
+}
+
+// 初始化连接，按照最大空闲数建立连接
+func (p *Pool) initConns() {
 	for i := int32(0); i < p.opts.MaxIdleConns; i++ {
 		if !p.askConnQuota() {
 			continue
@@ -90,22 +132,25 @@ func (p *Pool) initIdleConns() {
 			continue
 		}
 	}
-	p.resetIdleConnCount(p.chkConnCount())
 }
 
 // 新建连接
 func (p *Pool) newConn() (*Conn, error) {
-	conn, err := p.opts.Dial()
+	p.Lock()
+	defer p.Unlock()
+
+	conn, err := p.opts.Dial(p.readyTunnel)
 	if err != nil {
 		return nil, err
 	}
 
 	p.conns = append(p.conns, conn)
-	atomic.AddInt32(&p.connCount, 1)
+	p.addConnCount()
+	p.addIdleConnCount()
 	return conn, nil
 }
 
-// 连接管理地址
+// 空闲连接数管理
 func (p *Pool) idleConnManager() {
 	tricker := time.NewTicker(p.opts.CheckPeriod)
 	for {
@@ -115,40 +160,31 @@ func (p *Pool) idleConnManager() {
 }
 
 // 重置连接池
-// 1. 重置连接池时，任何索取连接的操作都不允许
 func (p *Pool) reset() {
 	p.Lock()
 	defer p.Unlock()
 
-	// 重置索引
-	newIdx := int32(-1)
-	connIdx := int(p.connIndex) % int(atomic.LoadInt32(&p.connCount))
-
-	// 重置连接统计
 	idleCount := int32(0)
 	connCount := int32(0)
-
-	// 重置连接池
+	closeCount := int32(0)
 	conns := []*Conn{}
 
-	// 关闭可以关闭的连接
-	for idx, conn := range p.conns {
+	for _, conn := range p.conns {
 		// 移除需要关闭的连接
 		if conn.removeAble() {
 			conn.close()
-			p.subClosingConnCount()
 			p.rbkConnQuota()
 			continue
 		}
 
-		// 确定新的索引
-		if idx <= connIdx {
-			newIdx += 1
+		// 统计仍处于待关闭状态的
+		if conn.closing {
+			closeCount += 1
 		}
 
-		// 保留的连接
+		// 剩余的连接
 		connCount += 1
-		if atomic.LoadInt32(&conn.ref) == 0 {
+		if conn.chkRef() == 0 {
 			idleCount += 1
 		}
 		conns = append(conns, conn)
@@ -157,53 +193,15 @@ func (p *Pool) reset() {
 	// 标记下次需要关闭的连接
 	shouldClosed := idleCount - p.opts.MaxIdleConns
 	for i := 0; i < int(shouldClosed); i++ {
-		p.addClosingConnCount()
+		closeCount += 1
 		conns[i].setClosing()
 	}
 
 	// 重置连接
 	p.conns = conns
 
-	// 重置索引
-	if int(newIdx+1) > len(p.conns) {
-		newIdx = int32(len(p.conns) - 1)
-	}
-	p.resetConnIndex(newIdx)
-
 	// 重置统计值
 	p.resetConnCount(connCount)
 	p.resetIdleConnCount(idleCount)
-
-	if shouldClosed < 0 {
-		shouldClosed = 0
-	}
-	p.resetClosingConnCount(shouldClosed)
-}
-
-// debug 打印
-func (p *Pool) DescribeTimer() {
-	tricker := time.NewTicker(time.Millisecond * 500)
-	for {
-		<-tricker.C
-		fmt.Println(p.Describe())
-	}
-}
-
-// 输出连接池状态
-func (p *Pool) Describe() string {
-	summary := fmt.Sprintf("Pool{connCount:%d, connIdleCount:%d, connClosingCount:%d, connIndex:%d, refCount:%d}\nConns:\n",
-		atomic.LoadInt32(&p.connCount),
-		atomic.LoadInt32(&p.connIdleCount),
-		atomic.LoadInt32(&p.connClosingCount),
-		atomic.LoadInt32(&p.connIndex),
-		atomic.LoadInt32(&p.refCount))
-
-	conns := []string{}
-	p.RLock()
-	defer p.RUnlock()
-	for _, conn := range p.conns {
-		conns = append(conns, conn.Describe())
-	}
-
-	return summary + strings.Join(conns, "\n")
+	p.resetClosingConnCount(closeCount)
 }

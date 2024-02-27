@@ -2,7 +2,7 @@ package gogrpcpool
 
 import (
 	"fmt"
-	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 )
@@ -11,13 +11,44 @@ import (
 grpc 客户端连接管理
 
 1. 实例化时设置 ref 为0，每次引用时加一，释放时减一
-2. 后台连接数管理器巡查连接数量时，当空闲连接数超过目标值的时候 且 ref小于等于0时，标记为 notAllowed
-3. 获取连接时，需要传入允许的最大引用次数 maxRef，当ref大于等于 maxRef 时，返回 ErrConnTooManyReference
+2. 连接被建立时，需要启动一个goroutine来运行 run() 方法，该方法会实时检测连接的状态，来实时将可用状态下的连接推入到 readyTunnel 中
+3. 当 closing = true 时，连接将不允许再被引用，也就不能够再推到 readyTunnel 中，也意味着 ref 的值不会再增加
+4. 当 closing = true 且 ref为0 时, 在Pool中会被 idleConnManager 关闭和删除
+5. 当 ref >= refMax 时，连接也将不能够再被引用，也就不能够再推到 readyTunnel 中，但是 run 方法会每隔1ms进行一次ref检测，当ref < refMax 时，连接将再次被推入到 readyTunnel 中
 */
 type Conn struct {
-	ref     int32            // allow reference count
-	closing bool             // allow close connection
-	conn    *grpc.ClientConn // grpc *ClientConn
+	// grpc ClientConn
+	conn *grpc.ClientConn
+
+	// 连接的引用次数， 每 acquire 一次加一，连接归还时减一
+	ref    int32
+	refMax int32
+
+	// 关闭状态, 当连接需要准备关闭时，将其设置为true，之后连接将不能够再推到 就绪管道 readyTunnel 中
+	closing bool
+	// 就绪状态, 当连接被成功推入就绪管道 readyTunnel 中时，被设定为 true, 当连接被取用时，重置为false
+	readying bool
+
+	// 就绪管道，该管道是对 Pool 中的 readyTunnel 的引用
+	// 在Pool中每当需要连接时，会通过 <-readyTunnel 取用连接
+	readyTunnel chan<- *Conn
+}
+
+func (c *Conn) run() {
+	for {
+		if c.closing {
+			break
+		}
+
+		// 连接的引用次数满了 或者 连接已经处于就绪状态则等待 则睡眠等待
+		if c.isMaxRef() || c.readying {
+			time.Sleep(time.Millisecond * 1)
+			continue
+		}
+
+		c.readyTunnel <- c
+		c.setReady()
+	}
 }
 
 // 引用grpc客户端连接
@@ -25,75 +56,7 @@ func (c *Conn) Refer() *grpc.ClientConn {
 	return c.conn
 }
 
-// 申请一个连接的使用权
-// 1. 对比每个连接的最大引用次数，如果超过则返回错误
-// 2. 如果传入 abd = true 说明连接新建数目已达上限，此时会强行复用当下连接
-func (c *Conn) acquire(max int32, abs bool) (int32, error) {
-	if c.closing {
-		return -1, ErrConnIsClosing
-	}
-
-	if abs {
-		_ref := c.addConnRef()
-		return _ref, nil
-	}
-
-	_ref := c.addConnRef()
-	if _ref > max {
-		return c.subConnRef(), ErrConnTooManyReference
-	}
-
-	return _ref, nil
-}
-
-// 增加一个连接的引用数
-func (c *Conn) addConnRef() int32 {
-	return atomic.AddInt32(&c.ref, 1)
-}
-
-// 减少一个连接的引用数
-func (c *Conn) subConnRef() int32 {
-	ref := atomic.AddInt32(&c.ref, -1)
-	if ref < 0 {
-		return atomic.AddInt32(&c.ref, 1)
-	}
-	return ref
-}
-
-// 检查连接引用数
-func (c *Conn) chkRef() int32 {
-	ref := atomic.LoadInt32(&c.ref)
-	if ref < 0 {
-		ref = 0
-	}
-	return ref
-}
-
-// 释放一个连接的使用权
-// 1. 这个调用应该有连接池来执行
-func (c *Conn) release() int32 {
-	return c.subConnRef()
-}
-
-// 标记一个连接处于正在关闭状态
-// 1. 关闭中的连接不能被再次引用
-func (c *Conn) setClosing() {
-	c.closing = true
-}
-
-// 判断一个连接是否可以被删除
-func (c *Conn) removeAble() bool {
-	return c.closing && c.chkRef() <= 0
-}
-
-// 关闭一个连接
-func (c *Conn) close() error {
-	if c.conn == nil {
-		return nil
-	}
-	return c.conn.Close()
-}
-
+// 描述信息
 func (c *Conn) Describe() string {
-	return fmt.Sprintf("ref: %v, closing: %v", atomic.LoadInt32(&c.ref), c.closing)
+	return fmt.Sprintf("ref: %v, closing: %v, readying: %v", c.chkRef(), c.closing, c.readying)
 }

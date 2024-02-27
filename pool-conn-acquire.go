@@ -1,39 +1,36 @@
 package gogrpcpool
 
+import (
+	"context"
+	"time"
+)
+
 // 寻求一个可用的连接
-func (p *Pool) Acquire() (*Conn, error) {
-	// 连接已满,强行复用已有连接
-	if p.NoMoreConnect() {
-		return p.picker(p.opts.MaxConns, true)
-	}
+func (p *Pool) Acquire(d time.Duration) (*Conn, error) {
+	// 先把引用次数加一 避免并发导致无法在此新建连接
+	p.addConnRefCount()
 
 	// 尝试建立新连接
-	// 1. 当前连接的引用总数是否达到了目标比率以上，此时新建一个连接
-	// 2. 通过原子操作连接配额，来控制并发避免超出最大连接数
+	// 1. 当前连接的引用总数 达到了目标引用占比以上，此时新建一个连接
+	// 2. 通过原子操作申请连接配额，来避免并发新建连接导致连接数超出最大限制
 	if p.connRefReached() && p.askConnQuota() {
-		// 新建连接成功
-		p.Lock()
-		if conn, err := p.newConn(); err == nil {
-			p.addConnRefCount()
-			p.Unlock()
-			return conn, nil
+		if _, err := p.newConn(); err != nil {
+			// 连接建立失败 连接额度归还
+			p.rbkConnQuota()
 		}
-		p.Unlock()
-
-		// 新建连接失败，强行复用下一个连接
-		// 1. 连接资源归还
-		//2. 这里不用担心连接引用是否超过最大数,因为连接池越往后的连接引用数一定大于前面的连接引用数
-		p.rbkConnQuota()
-		return p.picker(p.opts.MaxConns, true)
 	}
 
-	// 通常是复用已有的连接
-	return p.picker(p.opts.MaxConns, false)
+	// 选取已建立的连接
+	conn, err := p.picker(d)
+	if err != nil {
+		p.subConnRefCount()
+	}
+	return conn, err
 }
 
-// 归还一个连接
-// 1. 需要在 defer func 中执行
-// 2. 当连接的引用数为0时，说明连接处于准备好的空闲状态
+// 释放一个连接的引用数
+// 1. 需要在 Acquire 之后，在 defer 中执行，避免忘记执行
+// 2. 当连接的引用数为0时，说明连接处于空闲状态，对空闲连接数加一
 func (p *Pool) Release(conn *Conn) {
 	conn.release()
 	if p.subConnRefCount() == 0 {
@@ -41,52 +38,19 @@ func (p *Pool) Release(conn *Conn) {
 	}
 }
 
-// 从连接池中挑一个
-// 1. 挑选的顺序是优先挑选的被引用次数少的连接
-// 2. 从connIndex开始到最后一个索引进行查找
-// 3. 再从 0 到 connIndex 进行查找
-// 4. connIndex 是一个从小到大的值，由于连接有后台关闭和新建的操作所以 connIndex 并不一定能准确找到可用连接，但是他是一个相对准切的近似索引
-func (p *Pool) picker(max int32, abs bool) (*Conn, error) {
-	p.RLock()
-	defer p.RUnlock()
+// 从就绪的连接中选一个使用
+func (p *Pool) picker(d time.Duration) (*Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
 
-	// 计算索引
-	index := p.addConnIndex()
-	connCount := p.chkConnCount()
-
-	// 排查后面部分
-	for i := index; i < connCount; i++ {
-		ref, err := p.conns[i].acquire(max, abs)
-		if err != nil {
-			continue
-		}
-
-		// 引用数为1说明一个连接第一次被使用，意味着空闲连接数少了一个
-		if ref == 1 {
+	select {
+	case conn := <-p.readyTunnel:
+		// 引用数为，说明这个连接刚从空闲状态启用，意味着空闲连接数少了一个
+		if conn.acquire() == 1 {
 			p.subIdleConnCount()
 		}
-
-		// 拿到连接后，引用数加1
-		p.addConnRefCount()
-		return p.conns[i], nil
+		return conn, nil
+	case <-ctx.Done():
+		return nil, ErrWaitConnReadyTimeout
 	}
-
-	// 排查前面部分
-	for i := int32(0); i < index; i++ {
-		ref, err := p.conns[i].acquire(max, abs)
-		if err != nil {
-			continue
-		}
-
-		// 引用数为1说明一个连接第一次被使用，意味着空闲连接数少了一个
-		if ref == 1 {
-			p.subIdleConnCount()
-		}
-
-		// 拿到连接后，引用数加1
-		p.addConnRefCount()
-		return p.conns[i], nil
-	}
-
-	return nil, ErrNoConnAvailable
 }

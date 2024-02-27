@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -26,20 +25,23 @@ var (
 
 func init() {
 	grpcConnPool = grpcpool.NewPool(grpcpool.Options{
-		Debug:        true,
-		CheckPeriod:  time.Second * 10,
-		Target:       *addr,
-		Dopts:        []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		MaxConns:     30,
-		MaxIdleConns: 10,
-		MaxRefs:      10,
+		Debug:            true,
+		DescribeDuration: time.Second * 1,
+		CheckPeriod:      time.Second * 30,
+		ConnTimeOut:      time.Millisecond * 50,
+		Target:           *addr,
+		Dopts:            []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		MaxConns:         30,
+		MaxIdleConns:     5,
+		MaxRefs:          10,
+		NewConnRate:      2,
 	})
 	grpcConnPool.Run()
 }
 
 func sayHello(pool *grpcpool.Pool, n int, tm time.Duration) {
 	// 获取连接
-	conn, err := pool.Acquire()
+	conn, err := pool.Acquire(tm / 2)
 	if err != nil {
 		log.Printf("Call %d: could not acquire conn: %v", n, err)
 		return
@@ -48,8 +50,9 @@ func sayHello(pool *grpcpool.Pool, n int, tm time.Duration) {
 
 	// 发起grpc请求
 	c := pb.NewGreeterClient(conn.Refer())
-	ctx, cancel := context.WithTimeout(context.Background(), tm)
+	ctx, cancel := context.WithTimeout(context.Background(), tm/2)
 	defer cancel()
+
 	_, err = c.SayHello(ctx, &pb.HelloRequest{Name: *name})
 	if err != nil {
 		log.Printf("Call %d: could not greet: %v", n, err)
@@ -58,23 +61,20 @@ func sayHello(pool *grpcpool.Pool, n int, tm time.Duration) {
 }
 
 func main() {
+	defer grpcConnPool.Close()
 	flag.Parse()
 
-	tricker := time.NewTicker(time.Second * 2)
-
 	for {
-
 		wg := sync.WaitGroup{}
 		for i := 0; i < 100; i++ {
 			wg.Add(1)
 			go func(n int) {
 				defer wg.Done()
-				sayHello(grpcConnPool, n, time.Millisecond*10)
+				sayHello(grpcConnPool, n, time.Millisecond*20)
 			}(i)
 		}
 		wg.Wait()
 
-		fmt.Println(time.Now())
-		<-tricker.C
+		time.Sleep(time.Millisecond * 50)
 	}
 }

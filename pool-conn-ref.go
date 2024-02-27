@@ -13,8 +13,7 @@ func (p *Pool) addConnRefCount() int32 {
 func (p *Pool) subConnRefCount() int32 {
 	ref := atomic.AddInt32(&p.refCount, -1)
 	if ref < 0 {
-		atomic.AddInt32(&p.refCount, 1)
-		ref += 1
+		return atomic.AddInt32(&p.refCount, 1)
 	}
 	return ref
 }
@@ -26,25 +25,10 @@ func (p *Pool) chkConnReferd() int32 {
 
 // 当前连接的引用总数是否达到了目标比率以上
 func (p *Pool) connRefReached() bool {
-	return p.chkConnReferd() >= p.opts.MaxRefs*(p.chkConnCount()-p.chkClosingConnCount())/p.opts.NewByRefRate
+	return p.chkConnReferd() >= p.opts.MaxRefs*(p.chkConnCount()-p.chkClosingConnCount())/p.opts.NewConnRate
 }
 
-// 索引步进1
-func (p *Pool) addConnIndex() int32 {
-	return atomic.AddInt32(&p.connIndex, 1)
-}
-
-// 索引步进-1
-func (p *Pool) subConnIndex() int32 {
-	idx := atomic.AddInt32(&p.connIndex, -1)
-	if idx < -1 {
-		atomic.AddInt32(&p.connIndex, 1)
-		idx += 1
-	}
-	return idx
-}
-
-// 重置索引
-func (p *Pool) resetConnIndex(idx int32) {
-	atomic.StoreInt32(&p.connIndex, idx)
+// 重置连接的引用次数
+func (p *Pool) resetConnRefCount(count int32) {
+	atomic.StoreInt32(&p.refCount, count)
 }
