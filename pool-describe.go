@@ -2,6 +2,7 @@ package gogrpcpool
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -12,7 +13,7 @@ func (p *Pool) DescribeTimer() {
 	tricker := time.NewTicker(p.opts.DescribeDuration)
 	for {
 		<-tricker.C
-		fmt.Println(p.Describe())
+		log.Println(p.Describe())
 	}
 }
 

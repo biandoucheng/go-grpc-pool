@@ -28,6 +28,7 @@ func init() {
 		Debug:            true,
 		DescribeDuration: time.Second * 1,
 		CheckPeriod:      time.Second * 30,
+		ConnBlock:        true,
 		ConnTimeOut:      time.Millisecond * 50,
 		Target:           *addr,
 		Dopts:            []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},

@@ -140,7 +140,12 @@ func (p *Pool) newConn(block bool) (*Conn, error) {
 	p.Lock()
 	defer p.Unlock()
 
+	st := time.Now().UTC().UnixMilli()
 	conn, err := p.opts.Dial(p.readyTunnel, block)
+	if p.opts.Debug {
+		log.Printf("newConn: cost %v ms", time.Now().UnixMilli()-st)
+	}
+
 	if err != nil {
 		return nil, err
 	}
