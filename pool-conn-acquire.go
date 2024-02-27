@@ -14,7 +14,7 @@ func (p *Pool) Acquire(d time.Duration) (*Conn, error) {
 	// 1. 当前连接的引用总数 达到了目标引用占比以上，此时新建一个连接
 	// 2. 通过原子操作申请连接配额，来避免并发新建连接导致连接数超出最大限制
 	if p.connRefReached() && p.askConnQuota() {
-		if _, err := p.newConn(); err != nil {
+		if _, err := p.newConn(false); err != nil {
 			// 连接建立失败 连接额度归还
 			p.rbkConnQuota()
 		}

@@ -38,6 +38,7 @@ func NewPool(opts Options) *Pool {
 			DescribeDuration: opts.DescribeDuration,
 			CheckPeriod:      opts.CheckPeriod,
 			ConnTimeOut:      opts.ConnTimeOut,
+			ConnBlock:        opts.ConnBlock,
 			Target:           opts.Target,
 			Dopts:            []grpc.DialOption{},
 			MaxConns:         opts.MaxConns,
@@ -127,7 +128,7 @@ func (p *Pool) initConns() {
 			continue
 		}
 
-		if _, err := p.newConn(); err != nil {
+		if _, err := p.newConn(p.opts.ConnBlock); err != nil {
 			p.rbkConnQuota()
 			continue
 		}
@@ -135,11 +136,11 @@ func (p *Pool) initConns() {
 }
 
 // 新建连接
-func (p *Pool) newConn() (*Conn, error) {
+func (p *Pool) newConn(block bool) (*Conn, error) {
 	p.Lock()
 	defer p.Unlock()
 
-	conn, err := p.opts.Dial(p.readyTunnel)
+	conn, err := p.opts.Dial(p.readyTunnel, block)
 	if err != nil {
 		return nil, err
 	}
