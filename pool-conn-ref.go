@@ -1,6 +1,8 @@
 package gogrpcpool
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+)
 
 // 引用计算
 
@@ -24,8 +26,9 @@ func (p *Pool) chkConnReferd() int32 {
 }
 
 // 当前连接的引用总数是否达到了目标比率以上
-func (p *Pool) connRefReached() bool {
-	return p.chkConnReferd() >= p.opts.MaxRefs*(p.chkConnCount()-p.chkClosingConnCount())/p.opts.NewConnRate
+func (p *Pool) connRefReached(ref int32) bool {
+	rate := p.opts.MaxRefs * (p.chkConnCount() - p.chkClosingConnCount()) / p.opts.NewConnRate
+	return ref >= rate
 }
 
 // 重置连接的引用次数

@@ -8,12 +8,12 @@ import (
 // 寻求一个可用的连接
 func (p *Pool) Acquire(d time.Duration) (*Conn, error) {
 	// 先把引用次数加一 避免并发导致无法在此新建连接
-	p.addConnRefCount()
+	ref := p.addConnRefCount()
 
 	// 尝试建立新连接
 	// 1. 当前连接的引用总数 达到了目标引用占比以上，此时新建一个连接
 	// 2. 通过原子操作申请连接配额，来避免并发新建连接导致连接数超出最大限制
-	if p.connRefReached() && p.askConnQuota() {
+	if p.connRefReached(ref) && p.askConnQuota() {
 		if _, err := p.newConn(false); err != nil {
 			// 连接建立失败 连接额度归还
 			p.rbkConnQuota()
