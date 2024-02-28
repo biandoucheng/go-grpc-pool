@@ -12,18 +12,18 @@ import (
 // 连接池
 // 1. 一定要时刻保证连接池约靠后的部分引用数是越小的
 type Pool struct {
-	sync.RWMutex // lock
+	sync.RWMutex
 
-	opts  Options // dial options
-	conns []*Conn // all connections
+	opts  Options
+	conns []*Conn
 
-	connQuota        int32 // quota of connections,用于确认是否还可以建立新的连接,它可能是不准确的，因为是通过原子加法来做余额判断
-	connCount        int32 // current count of connections, should be write locked before counting,用来做真实连接数计算
-	connIdleCount    int32 // current count of idle connections
-	connClosingCount int32 // current count of closing connections
+	connQuota        int32 // 最大连接数配额，新建连接时减一，关闭连接时加一
+	connCount        int32 // 当前已建立连接数，用来做真实连接数计算
+	connIdleCount    int32 // 当前空闲连接数
+	connClosingCount int32 // 正处于关闭中状态的连接数
 
-	refCount    int32      // current count of references
-	readyTunnel chan *Conn // ready tunnel
+	refCount    int32      // 连接总的引用计数
+	readyTunnel chan *Conn // 就绪连接通道，连接池从这里去就绪的连接，就绪的连接主动将自己推入这个通道
 }
 
 // 实例化连接池
@@ -37,6 +37,7 @@ func NewPool(opts Options) *Pool {
 			Debug:            opts.Debug,
 			DescribeDuration: opts.DescribeDuration,
 			CheckPeriod:      opts.CheckPeriod,
+			CloseWait:        opts.CloseWait,
 			ConnTimeOut:      opts.ConnTimeOut,
 			ConnBlock:        opts.ConnBlock,
 			Target:           opts.Target,
@@ -53,6 +54,10 @@ func NewPool(opts Options) *Pool {
 
 	if pool.opts.CheckPeriod < time.Second*3 {
 		pool.opts.CheckPeriod = time.Second * 3
+	}
+
+	if pool.opts.CloseWait < time.Second {
+		pool.opts.CloseWait = time.Second * 20
 	}
 
 	if pool.opts.NewConnRate < 2 {
@@ -90,7 +95,7 @@ func (p *Pool) Close() {
 
 	// 标记所有连接为关闭状态
 	for _, conn := range p.conns {
-		conn.setClosing()
+		conn.setClosing(true)
 	}
 
 	// 关闭就绪通道
@@ -154,60 +159,4 @@ func (p *Pool) newConn(block bool) (*Conn, error) {
 	p.addConnCount()
 	p.addIdleConnCount()
 	return conn, nil
-}
-
-// 空闲连接数管理
-func (p *Pool) idleConnManager() {
-	tricker := time.NewTicker(p.opts.CheckPeriod)
-	for {
-		<-tricker.C
-		p.reset()
-	}
-}
-
-// 重置连接池
-func (p *Pool) reset() {
-	p.Lock()
-	defer p.Unlock()
-
-	idleCount := int32(0)
-	connCount := int32(0)
-	closeCount := int32(0)
-	conns := []*Conn{}
-
-	for _, conn := range p.conns {
-		// 移除需要关闭的连接
-		if conn.removeAble() {
-			conn.close()
-			p.rbkConnQuota()
-			continue
-		}
-
-		// 统计仍处于待关闭状态的
-		if conn.closing {
-			closeCount += 1
-		}
-
-		// 剩余的连接
-		connCount += 1
-		if conn.chkRef() == 0 {
-			idleCount += 1
-		}
-		conns = append(conns, conn)
-	}
-
-	// 标记下次需要关闭的连接
-	shouldClosed := idleCount - p.opts.MaxIdleConns
-	for i := 0; i < int(shouldClosed); i++ {
-		closeCount += 1
-		conns[i].setClosing()
-	}
-
-	// 重置连接
-	p.conns = conns
-
-	// 重置统计值
-	p.resetConnCount(connCount)
-	p.resetIdleConnCount(idleCount)
-	p.resetClosingConnCount(closeCount)
 }

@@ -27,6 +27,7 @@ func init() {
 	grpcConnPool = grpcpool.NewPool(grpcpool.Options{
 		Debug:            true,
 		DescribeDuration: time.Second * 1,
+		CloseWait:        time.Second * 20,
 		CheckPeriod:      time.Second * 30,
 		ConnBlock:        true,
 		ConnTimeOut:      time.Millisecond * 50,

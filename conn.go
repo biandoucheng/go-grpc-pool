@@ -15,6 +15,7 @@ grpc 客户端连接管理
 3. 当 closing = true 时，连接将不允许再被引用，也就不能够再推到 readyTunnel 中，也意味着 ref 的值不会再增加
 4. 当 closing = true 且 ref为0 时, 在Pool中会被 idleConnManager 关闭和删除
 5. 当 ref >= refMax 时，连接也将不能够再被引用，也就不能够再推到 readyTunnel 中，但是 run 方法会每隔1ms进行一次ref检测，当ref < refMax 时，连接将再次被推入到 readyTunnel 中
+6. 仅当 ref <= 0 且 lastReferAt 在 closeWait 之前，才能将 closing 设置为 true
 */
 type Conn struct {
 	// grpc ClientConn
@@ -24,6 +25,11 @@ type Conn struct {
 	ref    int32
 	refMax int32
 
+	// 最近引用时间
+	lastReferAt time.Time
+
+	// 关闭等待周期, 即：当最后一次引用时间距离当前时间超过 closeWait 时，连接可以被关闭
+	closeWait time.Duration
 	// 关闭状态, 当连接需要准备关闭时，将其设置为true，之后连接将不能够再推到 就绪管道 readyTunnel 中
 	closing bool
 	// 就绪状态, 当连接被成功推入就绪管道 readyTunnel 中时，被设定为 true, 当连接被取用时，重置为false

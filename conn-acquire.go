@@ -2,12 +2,14 @@ package gogrpcpool
 
 import (
 	"sync/atomic"
+	"time"
 )
 
 // 申请一个连接的使用权
 // 1. 这个调用应该由连接池来执行，引用后引用数进行原子加一
 // 2. 使用完毕后，引用者应该调用release进行原子减一
 func (c *Conn) acquire() int32 {
+	c.lastReferAt = time.Now()
 	ref := c.addConnRef()
 	c.unsetReady()
 	return ref
